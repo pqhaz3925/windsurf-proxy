@@ -1,0 +1,245 @@
+// Extracted from Go binary: language_server_macos_arm (v1.108.2)
+// Package: exa.api_server_pb
+// File: exa/api_server_pb/api_server.proto
+//
+// THIS IS WHAT OUR MOCK SERVER MUST IMPLEMENT
+// The Go binary calls our server as "ApiServerService"
+
+syntax = "proto3";
+package exa.api_server_pb;
+
+// ─── The streaming response our mock must send ───
+
+// This is the format the Go binary expects from the API server (us)
+// Each streaming chunk is one of these messages
+message GetChatMessageResponse {
+  // oneof _actual_model_uid (index 0)
+  string message_id = 1;                               // UUID, same across all chunks
+  google.protobuf.Timestamp timestamp = 2;              // current time
+  string delta_text = 3;                                 // incremental text content
+  uint32 delta_tokens = 4;                               // token count for this chunk
+  StopReason stop_reason = 5;                            // 0 while streaming, 2 when done
+  repeated ChatToolCall delta_tool_calls = 6;            // tool calls (if any)
+  ModelUsageStats usage = 7;                             // token usage stats
+  bool redact = 8;                                       // redaction flag
+  string delta_thinking = 9;                             // *** THINKING/REASONING TEXT ***
+  string delta_signature = 10;                           // signature delta
+  bool thinking_redacted = 11;                           // thinking redaction flag
+  double latency = 12;                                   // response latency
+  CompletionProfile completion_profile = 13;             // completion profile
+  int32 credit_cost = 14;                                // credit cost
+  string output_id = 15;                                 // output block ID
+  string thinking_id = 16;                               // thinking block ID
+  string request_id = 17;                                // request ID
+  int32 committed_credit_cost = 18;                      // committed credit cost
+  string prompt = 19;                                    // prompt echo
+  string actual_model_uid = 20;                          // oneof _actual_model_uid — actual model used
+}
+
+// ─── Referenced types ───
+
+message ChatToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments_json = 3;
+  string invalid_json_str = 4;
+  string invalid_json_err = 5;
+  bool is_custom_tool_call = 6;
+}
+
+message ModelUsageStats {
+  Model model_deprecated = 1;
+  uint64 input_tokens = 2;
+  uint64 output_tokens = 3;
+  uint64 cache_write_tokens = 4;
+  uint64 cache_read_tokens = 5;
+  APIProvider api_provider = 6;
+  string message_id = 7;
+  map<string, string> response_header = 8;
+  string model_uid = 9;
+}
+
+enum StopReason {
+  STOP_REASON_UNSPECIFIED = 0;
+  STOP_REASON_INCOMPLETE = 1;
+  STOP_REASON_STOP_PATTERN = 2;
+  STOP_REASON_MAX_TOKENS = 3;
+  STOP_REASON_MIN_LOG_PROB = 4;
+  STOP_REASON_MAX_NEWLINES = 5;
+  STOP_REASON_EXIT_SCOPE = 6;
+  STOP_REASON_NONFINITE_LOGIT_OR_PROB = 7;
+  STOP_REASON_FIRST_NON_WHITESPACE_LINE = 8;
+  STOP_REASON_PARTIAL = 9;
+  STOP_REASON_FUNCTION_CALL = 10;
+  STOP_REASON_CONTENT_FILTER = 11;
+  STOP_REASON_NON_INSERTION = 12;
+  STOP_REASON_ERROR = 13;
+}
+
+enum ChatMessageSource {
+  CHAT_MESSAGE_SOURCE_UNSPECIFIED = 0;
+  CHAT_MESSAGE_SOURCE_USER = 1;
+  CHAT_MESSAGE_SOURCE_SYSTEM = 2;
+  CHAT_MESSAGE_SOURCE_UNKNOWN = 3;
+  CHAT_MESSAGE_SOURCE_TOOL = 4;
+  CHAT_MESSAGE_SOURCE_SYSTEM_PROMPT = 5;
+}
+
+// ─── Web Search RPC ────────────────────────────────────────────────────────
+// RPC: /exa.api_server_pb.ApiServerService/GetWebSearchResults  (UNARY)
+// RPC: /exa.api_server_pb.ApiServerService/GetWebSearchRedirect (UNARY)
+//
+// Source: extracted from Go binary language_server_macos_arm v1.108.2
+//   - descriptor bytes at file offset 37162092 (request) / 37162356 (response)
+//   - getter methods confirmed at offset ~47305000
+//   - JS class definitions in extension.js @ exa.codeium_common_pb
+// ─────────────────────────────────────────────────────────────────────────
+
+// ── Request sent by Go binary → our mock server ──
+
+message GetWebSearchResultsRequest {
+  // Metadata contains api_key, session_id, extension_version, etc.
+  // proto3_optional flag is set — presence-checked
+  optional exa.codeium_common_pb.Metadata metadata = 1;
+  string query = 2;          // The search query string
+  uint32 limit = 3;          // Max number of results to return (optional, 0 = server default)
+  string domain = 4;         // Restrict to domain (e.g. "docs.python.org"), optional
+  optional exa.codeium_common_pb.ThirdPartyWebSearchConfig third_party_config = 5;
+}
+
+// ── Response our mock server must return ──
+
+message GetWebSearchResultsResponse {
+  repeated exa.codeium_common_pb.KnowledgeBaseItem results = 1;
+  // URL of the web search result page (e.g. Bing/Google/Exa search results URL)
+  string web_search_url = 2;
+  // Optional AI-generated summary of the search results
+  string summary = 3;
+}
+
+// ── Redirect helper (resolves shortened / tracking URLs) ──
+
+message GetWebSearchRedirectRequest {
+  string original_url = 1;
+}
+
+message GetWebSearchRedirectResponse {
+  string redirect_url = 1;
+}
+
+// ─── codeium_common_pb types used above ──────────────────────────────────
+
+// Package: exa.codeium_common_pb
+// Source: extension.js class Qg / binary descriptor at 37464328
+
+message KnowledgeBaseItem {
+  string document_id = 1;   // Unique document identifier
+  string text = 2;          // Raw text content of the document
+  string url = 3;           // Source URL
+  string title = 4;         // Page/document title
+  google.protobuf.Timestamp timestamp = 5;
+  repeated KnowledgeBaseChunk chunks = 6;
+  string summary = 7;       // Summary of the document
+  // ImageData image = 8;   (not needed for web search mock)
+  // DOMTree dom_tree = 9;  (not needed for web search mock)
+}
+
+// Package: exa.codeium_common_pb
+// Source: extension.js class Bg / binary descriptor at 37464162
+
+message KnowledgeBaseChunk {
+  // oneof chunk_type:
+  string text = 1;                          // plain text chunk
+  // MarkdownChunk markdown_chunk = 3;      (not needed for mock)
+  int32 position = 2;                       // chunk index within document
+}
+
+// Package: exa.codeium_common_pb
+// Source: extension.js class jg @ "exa.codeium_common_pb.ThirdPartyWebSearchConfig"
+//   {no:1, name:"provider", kind:"enum", T: ThirdPartyWebSearchProvider}
+//   {no:2, name:"model",    kind:"enum", T: ThirdPartyWebSearchModel}
+
+message ThirdPartyWebSearchConfig {
+  ThirdPartyWebSearchProvider provider = 1;
+  ThirdPartyWebSearchModel model = 2;
+}
+
+// Source: extension.js proto3.util.setEnumType at offset 8650821
+enum ThirdPartyWebSearchProvider {
+  THIRD_PARTY_WEB_SEARCH_PROVIDER_UNSPECIFIED = 0;
+  THIRD_PARTY_WEB_SEARCH_PROVIDER_OPENAI = 1;
+}
+
+// Source: extension.js proto3.util.setEnumType at offset 8650909
+enum ThirdPartyWebSearchModel {
+  THIRD_PARTY_WEB_SEARCH_MODEL_UNSPECIFIED = 0;
+  THIRD_PARTY_WEB_SEARCH_MODEL_O3 = 1;
+  THIRD_PARTY_WEB_SEARCH_MODEL_GPT_4_1 = 2;
+  THIRD_PARTY_WEB_SEARCH_MODEL_O4_MINI = 3;
+}
+
+// ─── How the mock should respond ─────────────────────────────────────────
+//
+// The Go binary calls GetWebSearchResults when Cascade uses the web search tool.
+// The binary then sends the results back to the extension as part of a
+// CortexStepSearchWeb step inside a GetChatMessageResponse stream chunk.
+//
+// CortexStepSearchWeb fields (exa.cortex_pb, in GetChatMessageResponse):
+//   no:1  query           string
+//   no:2  web_documents   repeated KnowledgeBaseItem
+//   no:3  domain          string
+//   no:4  web_search_url  string
+//   no:5  summary         string
+//   no:6  third_party_config ThirdPartyWebSearchConfig
+//
+// To mock GetWebSearchResults, return a GetWebSearchResultsResponse where:
+//   results[i].url    = "https://example.com/page"
+//   results[i].title  = "Page Title"
+//   results[i].text   = "Snippet / content"
+//   web_search_url    = "https://search.example.com/?q=..."
+//   summary           = "" (optional, may be empty)
+//
+// The binary sends ~634-647 byte requests (Metadata ~400b + query + limit + config)
+// ─────────────────────────────────────────────────────────────────────────
+
+// ─── Language server response (Go binary → Extension) ───
+// NOT what we implement — this is what the Go binary converts our response into
+// before sending to the extension
+
+// message language_server_pb.GetChatMessageResponse {
+//   ChatMessage chat_message = 1;
+//   uint32 num_tokens_in_intent = 2;
+// }
+//
+// message ChatMessage {
+//   string message_id = 1;
+//   ChatMessageSource source = 2;
+//   Timestamp timestamp = 3;
+//   string conversation_id = 4;
+//   oneof content {
+//     ChatMessageIntent intent = 5;
+//     ChatMessageAction action = 6;   ← text goes here
+//     ChatMessageError error = 7;
+//     ChatMessageStatus status = 8;
+//   }
+//   bool in_progress = 9;
+//   GetChatMessageRequest request = 10;
+//   bool redact = 11;
+// }
+//
+// message ChatMessageAction {
+//   oneof action {
+//     ChatMessageActionGeneric generic = 1;  ← text/display_text
+//     ChatMessageActionEdit edit = 3;
+//     ChatMessageActionSearch search = 5;
+//   }
+//   uint32 num_tokens = 2;
+//   repeated CodeContextItem context_items = 4;
+//   ChatIntentType latest_intent = 6;
+//   ChatMetrics generation_stats = 7;
+// }
+//
+// message ChatMessageActionGeneric {
+//   string text = 1;
+//   string display_text = 2;
+// }

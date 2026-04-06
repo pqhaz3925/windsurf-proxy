@@ -1,0 +1,27 @@
+{
+  "name": "windsurf-proxy",
+  "version": "1.0.0",
+  "description": "Hybrid proxy for Windsurf IDE — intercepts chat, forwards everything else to Codeium",
+  "type": "module",
+  "main": "src/hybrid-server.js",
+  "scripts": {
+    "start": "node src/hybrid-server.js",
+    "start:inference": "node src/inference-proxy.js",
+    "start:both": "node src/hybrid-server.js & node src/inference-proxy.js",
+    "dev": "node --watch src/hybrid-server.js",
+    "dev:inference": "node --watch src/inference-proxy.js"
+  },
+  "keywords": [
+    "windsurf",
+    "codeium",
+    "anthropic",
+    "proxy",
+    "connect-rpc",
+    "protobuf",
+    "reverse-engineering"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

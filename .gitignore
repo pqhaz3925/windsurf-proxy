@@ -1,0 +1,8 @@
+node_modules/
+captures/
+decompiled/
+templates/
+*.log
+.DS_Store
+.env
+certs/*.pem
