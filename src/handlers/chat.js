@@ -305,10 +305,18 @@ function streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, res
 
     apiRes.on('end', () => {
       if (sseBuffer.trim()) processPart(sseBuffer);
+      // Force stop chunk if stream ended without response.completed
+      if (!processor.isDone && !res.writableEnded) {
+        console.log(`  ⚠️  OpenAI stream ended without response.completed — forcing stop`);
+        const finalChunks = processor.processEvent({ done: true, type: 'done', data: null });
+        for (const chunk of finalChunks) {
+          res.write(wrapEnvelope(chunk));
+        }
+      }
       if (!res.writableEnded) {
         res.write(endOfStreamEnvelope());
         res.end();
-        console.log(`  ✅ OpenAI stream ended`);
+        console.log(`  ✅ OpenAI stream ended (stop: ${processor.stopReason})`);
       }
     });
 
@@ -341,14 +349,19 @@ function streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, res
   apiReq.end(apiBody);
 }
 
-// ─── Anthropic → OpenAI message format converter ────────────
+// ─── Anthropic → OpenAI Responses API input converter ───────
+//
+// Responses API uses a flat array of typed items instead of messages:
+//   { role: "user"|"assistant"|"system"|"developer", content: "..." }
+//   { type: "function_call", call_id, name, arguments }
+//   { type: "function_call_output", call_id, output }
 
 function toOpenAIMessages(systemPrompt, anthropicMessages) {
   const result = [];
 
-  // System prompt → system message
+  // System prompt → developer message (Responses API prefers "developer" over "system")
   if (systemPrompt) {
-    result.push({ role: 'system', content: systemPrompt });
+    result.push({ role: 'developer', content: systemPrompt });
   }
 
   for (const msg of anthropicMessages) {
@@ -357,42 +370,36 @@ function toOpenAIMessages(systemPrompt, anthropicMessages) {
       continue;
     }
 
-    // Content is array of blocks — convert to OpenAI format
     if (!Array.isArray(msg.content)) {
       result.push({ role: msg.role, content: String(msg.content) });
       continue;
     }
 
     if (msg.role === 'assistant') {
-      // Assistant messages may have text + tool_use blocks
+      // Text content → assistant message
       let textContent = '';
-      const toolCalls = [];
-
       for (const block of msg.content) {
         if (block.type === 'text') {
           textContent += block.text;
-        } else if (block.type === 'tool_use') {
-          toolCalls.push({
-            id: block.id,
-            type: 'function',
-            function: {
-              name: block.name,
-              arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input),
-            },
-          });
         }
-        // thinking blocks are dropped — OpenAI doesn't support them
+      }
+      if (textContent) {
+        result.push({ role: 'assistant', content: textContent });
       }
 
-      const assistantMsg = { role: 'assistant' };
-      if (textContent) assistantMsg.content = textContent;
-      else assistantMsg.content = null;
-      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
-      result.push(assistantMsg);
+      // Tool calls → function_call items (Responses API format)
+      for (const block of msg.content) {
+        if (block.type === 'tool_use') {
+          result.push({
+            type: 'function_call',
+            call_id: block.id,
+            name: block.name,
+            arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input),
+          });
+        }
+      }
 
     } else if (msg.role === 'user') {
-      // User messages may have text, image, or tool_result blocks
-      const toolResults = [];
       const contentParts = [];
 
       for (const block of msg.content) {
@@ -400,33 +407,26 @@ function toOpenAIMessages(systemPrompt, anthropicMessages) {
           contentParts.push(block.text);
         } else if (block.type === 'image') {
           contentParts.push({
-            type: 'image_url',
-            image_url: {
-              url: `data:${block.source?.media_type || 'image/png'};base64,${block.source?.data || ''}`,
-            },
+            type: 'input_image',
+            image_url: `data:${block.source?.media_type || 'image/png'};base64,${block.source?.data || ''}`,
           });
         } else if (block.type === 'tool_result') {
-          toolResults.push({
-            role: 'tool',
-            tool_call_id: block.tool_use_id,
-            content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+          // Tool results → function_call_output items (Responses API format)
+          result.push({
+            type: 'function_call_output',
+            call_id: block.tool_use_id,
+            output: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
           });
         }
       }
 
-      // Tool results become separate messages in OpenAI format
-      for (const tr of toolResults) {
-        result.push(tr);
-      }
-
-      // Regular content
       if (contentParts.length > 0) {
-        const hasImages = contentParts.some(p => typeof p !== 'string');
-        if (hasImages) {
+        const hasMedia = contentParts.some(p => typeof p !== 'string');
+        if (hasMedia) {
           result.push({
             role: 'user',
             content: contentParts.map(p =>
-              typeof p === 'string' ? { type: 'text', text: p } : p
+              typeof p === 'string' ? { type: 'input_text', text: p } : p
             ),
           });
         } else {
