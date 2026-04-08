@@ -19,18 +19,16 @@ const API_KEY  = process.env.ANTHROPIC_API_KEY  || '';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL  || 'claude-sonnet-4-6';
 const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || '16384', 10);
 
-// OpenAI config (uses same host by default for unified endpoints like codex.alsa-llc.site)
+// OpenAI Responses API config (prompt cache, reasoning, 2h session keep-alive)
 const OPENAI_API_HOST = process.env.OPENAI_API_HOST || API_HOST;
-const OPENAI_API_PATH = process.env.OPENAI_API_PATH || '/v1/chat/completions';
+const OPENAI_API_PATH = process.env.OPENAI_API_PATH || '/v1/responses';
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY  || API_KEY;
 
 // ─── Provider detection ────────────────────────────────────
 
 // Models that should route through OpenAI Chat Completions API
-const OPENAI_MODELS = new Set([
-  'gpt-5-4-low', 'gpt-5-4-high',
-  'MODEL_GPT_4O', 'MODEL_GPT_4O_MINI',
-]);
+// Uses prefix matching — any model starting with 'gpt-' or 'MODEL_GPT' goes to OpenAI
+const OPENAI_PREFIXES = ['gpt-', 'MODEL_GPT'];
 
 // Map Windsurf model IDs → actual model names
 // GPT models go through OpenAI endpoint, Claude models through Anthropic
@@ -46,12 +44,14 @@ const MODEL_MAP = {
   // GPT models → OpenAI
   'gpt-5-4-low':             'gpt-5.4',
   'gpt-5-4-high':            'gpt-5.4',
+  'gpt-5-4-xhigh':           'gpt-5.4',
   'MODEL_GPT_4O':            'gpt-4o',
   'MODEL_GPT_4O_MINI':       'gpt-4o-mini',
 };
 
 function isOpenAIModel(requestedModel) {
-  return OPENAI_MODELS.has(requestedModel);
+  if (!requestedModel) return false;
+  return OPENAI_PREFIXES.some(p => requestedModel.startsWith(p));
 }
 
 // ─── Main handler ──────────────────────────────────────────
@@ -216,30 +216,30 @@ function streamAnthropic(req, res, { systemPrompt, messages, tools, toolChoice, 
   apiReq.end(apiBody);
 }
 
-// ─── OpenAI streaming ───────────────────────────────────────
+// ─── OpenAI Responses API streaming ─────────────────────────
 
 function streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId }) {
   // Convert Anthropic-format messages to OpenAI format
   const openaiMessages = toOpenAIMessages(systemPrompt, messages);
 
+  // Responses API payload — uses `input` instead of `messages`
   const apiPayload = {
     model: resolvedModel,
-    messages: openaiMessages,
+    input: openaiMessages,
     stream: true,
+    reasoning: { effort: 'high', summary: 'auto' },
   };
   if (tools && tools.length > 0) {
     apiPayload.tools = tools.map(t => ({
       type: 'function',
-      function: {
-        name: t.name,
-        description: t.description || '',
-        parameters: typeof t.input_schema === 'string' ? JSON.parse(t.input_schema) : t.input_schema,
-      },
+      name: t.name,
+      description: t.description || '',
+      parameters: typeof t.input_schema === 'string' ? JSON.parse(t.input_schema) : t.input_schema,
     }));
     if (toolChoice) {
       if (toolChoice.type === 'auto') apiPayload.tool_choice = 'auto';
       else if (toolChoice.type === 'any') apiPayload.tool_choice = 'required';
-      else if (toolChoice.type === 'tool') apiPayload.tool_choice = { type: 'function', function: { name: toolChoice.name } };
+      else if (toolChoice.type === 'tool') apiPayload.tool_choice = { type: 'function', name: toolChoice.name };
     }
   }
 

@@ -1,31 +1,28 @@
-// handlers/openai-stream.js — OpenAI Chat Completions SSE → protobuf chunk processor
+// handlers/openai-stream.js — OpenAI Responses API SSE → protobuf chunk processor
 //
-// Processes OpenAI streaming API SSE events and emits raw protobuf
+// Processes OpenAI Responses API streaming events and emits raw protobuf
 // GetChatMessageResponse buffers (NOT wrapped in Connect-RPC envelope).
 //
-// OpenAI SSE event sequence:
-//   data: {"id":"...","choices":[{"delta":{"role":"assistant"},...}]}
-//   data: {"id":"...","choices":[{"delta":{"content":"text"},...}]}
-//   ...
-//   data: {"id":"...","choices":[{"delta":{},"finish_reason":"stop",...}]}
-//   data: [DONE]
+// Responses API SSE event types:
+//   response.created              — initial response metadata
+//   response.in_progress          — status update
+//   response.output_item.added    — new output item (reasoning | message | function_call)
+//   response.reasoning.delta      — reasoning/thinking text delta  (NEW — 2025+)
+//   response.output_text.delta    — text content delta
+//   response.function_call_arguments.delta — tool call arguments delta
+//   response.content_part.done    — content part finalized
+//   response.output_item.done     — output item finalized
+//   response.completed            — final response with usage
 //
-// Tool calls come as:
-//   data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xxx","function":{"name":"fn","arguments":""}}]}}]}
-//   data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"partial"}}]}}]}
-//   ...
-//   data: {"choices":[{"finish_reason":"tool_calls",...}]}
-//
-// Usage:
-//   const processor = new OpenAIStreamProcessor(messageId, modelUid);
-//   for (const sseEvent of parseOpenAISSEChunk(rawChunk)) {
-//     const protoBuffers = processor.processEvent(sseEvent);
-//     for (const buf of protoBuffers) res.write(wrapEnvelope(buf));
-//   }
-//   if (processor.isDone) { res.write(endOfStreamEnvelope()); res.end(); }
+// Key differences from Chat Completions:
+//   - Events have a `type` field instead of raw `data:` JSON with choices
+//   - Reasoning comes as separate output items with summary
+//   - Tool calls are `function_call` type output items
+//   - Session/prompt caching built-in (2h keep-alive)
 
 import {
   buildTextDelta,
+  buildThinkingDelta,
   buildToolCallDelta,
   buildStopChunk,
   STOP_REASON,
@@ -34,13 +31,11 @@ import {
 // ─── SSE parser ────────────────────────────────────────────
 
 /**
- * Parse a raw OpenAI SSE text chunk into an array of data objects.
- *
- * OpenAI uses simpler SSE than Anthropic — no `event:` field, just `data:` lines.
- * The final event is `data: [DONE]`.
+ * Parse raw SSE text into typed event objects.
+ * Responses API uses `data:` lines with JSON containing a `type` field.
  *
  * @param {string} text - Raw SSE text (may contain multiple events)
- * @returns {{ done: boolean, data: any }[]}
+ * @returns {{ done: boolean, type: string, data: any }[]}
  */
 export function parseOpenAISSEChunk(text) {
   const events = [];
@@ -50,13 +45,14 @@ export function parseOpenAISSEChunk(text) {
     if (!line.startsWith('data: ')) continue;
     const payload = line.slice(6).trim();
     if (payload === '[DONE]') {
-      events.push({ done: true, data: null });
+      events.push({ done: true, type: 'done', data: null });
       continue;
     }
     try {
-      events.push({ done: false, data: JSON.parse(payload) });
+      const data = JSON.parse(payload);
+      events.push({ done: false, type: data.type || '', data });
     } catch {
-      // Skip malformed JSON lines
+      // Skip malformed JSON
     }
   }
 
@@ -65,20 +61,7 @@ export function parseOpenAISSEChunk(text) {
 
 // ─── Stream processor ──────────────────────────────────────
 
-/**
- * Stateful processor that maps OpenAI Chat Completions SSE events to raw
- * protobuf GetChatMessageResponse buffers.
- *
- * Tool call accumulation:
- *   - OpenAI streams tool calls incrementally by index
- *   - Each index accumulates id, name, and arguments across chunks
- *   - All accumulated tool calls are flushed on finish_reason="tool_calls"
- */
 export class OpenAIStreamProcessor {
-  /**
-   * @param {string} messageId - UUID echoed in every response chunk
-   * @param {string} modelUid  - Model name echoed in stop chunk
-   */
   constructor(messageId, modelUid) {
     this._messageId = messageId;
     this._modelUid = modelUid;
@@ -86,9 +69,15 @@ export class OpenAIStreamProcessor {
     this._done = false;
     this._stopReason = null;
 
-    // Tool call accumulators — keyed by index
+    // Tool call accumulators — keyed by output_index
     // { [index]: { id, name, arguments } }
     this._toolCalls = {};
+
+    // Track which output items are reasoning vs final answer
+    // { [output_index]: 'reasoning' | 'message' | 'function_call' }
+    this._itemTypes = {};
+    // Track message phases: { [output_index]: 'thinking' | 'final_answer' | undefined }
+    this._itemPhases = {};
   }
 
   get isDone() { return this._done; }
@@ -97,7 +86,7 @@ export class OpenAIStreamProcessor {
   /**
    * Process a single parsed SSE event and return proto buffers to send.
    *
-   * @param {{ done: boolean, data: any }} event
+   * @param {{ done: boolean, type: string, data: any }} event
    * @returns {Buffer[]}
    */
   processEvent(event) {
@@ -105,38 +94,98 @@ export class OpenAIStreamProcessor {
       return this._onDone();
     }
 
+    const { type, data } = event;
     const chunks = [];
-    const data = event.data;
-    if (!data?.choices?.length) return chunks;
 
-    const choice = data.choices[0];
-    const delta = choice.delta;
-    const finishReason = choice.finish_reason;
-
-    if (delta) {
-      // Text content
-      if (delta.content) {
-        this._tokenCount++;
-        chunks.push(buildTextDelta(this._messageId, delta.content, this._tokenCount));
-      }
-
-      // Tool calls (incremental by index)
-      if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          if (!this._toolCalls[idx]) {
-            this._toolCalls[idx] = { id: '', name: '', arguments: '' };
-          }
-          if (tc.id) this._toolCalls[idx].id = tc.id;
-          if (tc.function?.name) this._toolCalls[idx].name = tc.function.name;
-          if (tc.function?.arguments) this._toolCalls[idx].arguments += tc.function.arguments;
+    switch (type) {
+      // ── Reasoning (thinking) deltas ────────────────────
+      case 'response.reasoning.delta':
+        if (data.delta) {
+          chunks.push(buildThinkingDelta(this._messageId, data.delta));
         }
-      }
-    }
+        break;
 
-    // Capture finish reason
-    if (finishReason) {
-      this._stopReason = finishReason;
+      case 'response.reasoning_summary_text.delta':
+        if (data.delta) {
+          // Summary text also goes to thinking stream
+          chunks.push(buildThinkingDelta(this._messageId, data.delta));
+        }
+        break;
+
+      // ── Text content deltas ────────────────────────────
+      case 'response.output_text.delta':
+        if (data.delta) {
+          const idx = data.output_index ?? 0;
+          const itemType = this._itemTypes[idx];
+          const phase = this._itemPhases[idx];
+
+          // Route to thinking if: reasoning item, or message with thinking phase
+          if (itemType === 'reasoning' || phase === 'thinking') {
+            chunks.push(buildThinkingDelta(this._messageId, data.delta));
+          } else {
+            this._tokenCount++;
+            chunks.push(buildTextDelta(this._messageId, data.delta, this._tokenCount));
+          }
+        }
+        break;
+
+      // ── Tool/function call handling ────────────────────
+      case 'response.output_item.added': {
+        const item = data.item;
+        const idx = data.output_index ?? 0;
+        if (item) {
+          this._itemTypes[idx] = item.type; // 'reasoning' | 'message' | 'function_call'
+          if (item.phase) this._itemPhases[idx] = item.phase; // 'thinking' | 'final_answer'
+        }
+        if (item?.type === 'function_call') {
+          this._toolCalls[idx] = {
+            id: item.call_id || item.id || '',
+            name: item.name || '',
+            arguments: '',
+          };
+        }
+        break;
+      }
+
+      case 'response.function_call_arguments.delta': {
+        const idx = data.output_index ?? 0;
+        if (this._toolCalls[idx]) {
+          this._toolCalls[idx].arguments += data.delta || '';
+        }
+        break;
+      }
+
+      // ── Completion ─────────────────────────────────────
+      case 'response.completed': {
+        const resp = data.response;
+        if (resp?.status === 'completed') {
+          this._stopReason = 'stop';
+          // Check if it ended due to tool calls
+          const hasToolCalls = resp.output?.some(o => o.type === 'function_call');
+          if (hasToolCalls) this._stopReason = 'tool_calls';
+        }
+        // Flush everything on completed
+        return this._onDone();
+      }
+
+      // Skip metadata events
+      case 'response.created':
+      case 'response.in_progress':
+      case 'response.output_item.done':
+      case 'response.content_part.added':
+      case 'response.content_part.done':
+      case 'response.reasoning_summary_part.added':
+      case 'response.reasoning_summary_part.done':
+      case 'response.reasoning_summary_text.done':
+      case 'codex.rate_limits':
+        break;
+
+      default:
+        // Log unknown event types for debugging
+        if (type && !type.startsWith('response.')) {
+          console.log(`  ℹ️  Unknown OpenAI event: ${type}`);
+        }
+        break;
     }
 
     return chunks;
@@ -145,9 +194,10 @@ export class OpenAIStreamProcessor {
   // ── Private ─────────────────────────────────────────────
 
   _onDone() {
+    if (this._done) return [];
     const chunks = [];
 
-    // Flush accumulated tool calls if any
+    // Flush accumulated tool calls
     const toolIndices = Object.keys(this._toolCalls);
     if (toolIndices.length > 0) {
       const calls = toolIndices
@@ -160,7 +210,6 @@ export class OpenAIStreamProcessor {
       chunks.push(buildToolCallDelta(this._messageId, calls));
     }
 
-    // Emit stop chunk
     const protoStopReason = this._mapStopReason(this._stopReason);
     chunks.push(buildStopChunk(this._messageId, protoStopReason, this._modelUid));
     this._done = true;
@@ -168,14 +217,6 @@ export class OpenAIStreamProcessor {
     return chunks;
   }
 
-  /**
-   * Map OpenAI finish_reason → exa StopReason varint.
-   *
-   *   "stop"       → STOP_REASON_STOP_PATTERN  (2)
-   *   "tool_calls" → STOP_REASON_FUNCTION_CALL (10)
-   *   "length"     → STOP_REASON_MAX_TOKENS    (3)
-   *   (others)     → STOP_REASON_STOP_PATTERN  (2)
-   */
   _mapStopReason(reason) {
     switch (reason) {
       case 'stop':       return STOP_REASON.STOP_PATTERN;

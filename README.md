@@ -70,7 +70,7 @@ Optional:
 
 ```env
 # ANTHROPIC_API_PATH=/v1/messages       # custom Anthropic endpoint path
-# OPENAI_API_PATH=/v1/chat/completions  # custom OpenAI endpoint path
+# OPENAI_API_PATH=/v1/responses         # custom OpenAI endpoint path
 # DEFAULT_MODEL=claude-sonnet-4-6       # fallback model for unknown IDs
 # MAX_TOKENS=16384                      # max output tokens
 ```
