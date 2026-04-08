@@ -65,14 +65,18 @@ export function handleGetChatMessage(req, res, body) {
     return;
   }
 
-  const { systemPrompt, messages, tools, toolChoice, requestedModel, initiator } =
+  let { systemPrompt, messages, tools, toolChoice, requestedModel, initiator } =
     parseGetChatMessageRequest(body, req.headers);
 
   const useOpenAI = isOpenAIModel(requestedModel);
   const resolvedModel = MODEL_MAP[requestedModel] || DEFAULT_MODEL;
   const messageId = crypto.randomUUID();
 
-  console.log(`  🧠 Model: ${requestedModel} → ${resolvedModel} (${useOpenAI ? 'OpenAI' : 'Anthropic'})`);
+  // Inject model identity so the model knows what it is
+  const provider = useOpenAI ? 'OpenAI' : 'Anthropic';
+  systemPrompt += `\n\nYou are powered by ${resolvedModel} (${provider}).`;
+
+  console.log(`  🧠 Model: ${requestedModel} → ${resolvedModel} (${provider})`);
   console.log(`  📝 System prompt: ${systemPrompt.length} chars`);
   console.log(`  💬 Messages: ${messages.length}`);
   if (tools) console.log(`  🔧 Tools: ${tools.length}`);
