@@ -211,7 +211,34 @@ Windsurf sends internal model IDs. The proxy detects the provider and routes to 
 | `MODEL_GOOGLE_GEMINI_*` | Anthropic | `claude-sonnet-4-6` |
 | Everything else | Anthropic | `DEFAULT_MODEL` env var |
 
-Edit `MODEL_MAP` and `OPENAI_MODELS` in `src/handlers/chat.js` to customize routing.
+Edit `MODEL_MAP` and `OPENAI_PREFIXES` in `src/handlers/chat.js` to customize routing.
+
+---
+
+## Custom system prompt
+
+Replace Cascade's default instructions with your own while keeping all dynamic IDE context (tool definitions, workspace rules, memories) intact.
+
+### Setup
+
+1. Create your prompt file in `prompts/system-prompt.md` (a sample is included)
+2. Add to `.env`:
+
+```env
+SYSTEM_PROMPT_OVERRIDE=true
+SYSTEM_PROMPT_PATH=./prompts/system-prompt.md
+```
+
+### How it works
+
+Windsurf's system prompt has two parts:
+
+- **Static** — the "You are Cascade..." instructions (protobuf field 2)
+- **Dynamic** — workspace rules, memories, IDE context (`SYSTEM_PROMPT` source messages)
+
+The override replaces only the static part. Dynamic content from the IDE is still appended after your custom prompt.
+
+**Hot-reload:** Edit the prompt file while the proxy is running — the next request picks up changes automatically (no restart needed).
 
 ---
 
@@ -304,10 +331,13 @@ src/
 ├── proto.js                  # Protobuf wire format encoder/decoder
 ├── connect.js                # Connect-RPC envelope framing (5-byte prefix + gzip)
 └── handlers/
-    ├── chat.js               # GetChatMessage → Anthropic Messages API bridge
-    ├── parse-request.js      # Protobuf request → Anthropic message format converter
-    ├── build-response.js     # Anthropic response → protobuf frame builder
-    └── anthropic-stream.js   # SSE stream processor (Anthropic → Connect-RPC chunks)
+    ├── chat.js               # GetChatMessage → Anthropic/OpenAI API bridge
+    ├── parse-request.js      # Protobuf request → message format converter + prompt override
+    ├── build-response.js     # API response → protobuf frame builder
+    ├── anthropic-stream.js   # Anthropic SSE → Connect-RPC chunks
+    └── openai-stream.js      # OpenAI Responses API SSE → Connect-RPC chunks
+prompts/
+└── system-prompt.md          # Custom system prompt (used when SYSTEM_PROMPT_OVERRIDE=true)
 ```
 
 ---

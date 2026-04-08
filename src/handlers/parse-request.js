@@ -9,8 +9,39 @@
 //   string chat_model_uid = 21;                          // model ID
 // }
 
+import fs from 'node:fs';
 import { parseFields, getField, getAllFields } from '../proto.js';
 import { unwrapRequest } from '../connect.js';
+
+// ─── System prompt override ─────────────────────────────────
+//
+// Replace the static Cascade prompt (proto field 2) with a custom one.
+// Dynamic IDE additions (SOURCE.SYSTEM_PROMPT messages: workspace rules,
+// memories, context) are still appended after the override.
+//
+// Hot-reloads on file change — edit the file, next request picks it up.
+
+const SYSTEM_PROMPT_OVERRIDE = process.env.SYSTEM_PROMPT_OVERRIDE === 'true';
+const SYSTEM_PROMPT_PATH     = process.env.SYSTEM_PROMPT_PATH || '';
+
+let _promptCache = { content: '', mtime: 0, path: '' };
+
+function getCustomSystemPrompt() {
+  if (!SYSTEM_PROMPT_OVERRIDE || !SYSTEM_PROMPT_PATH) return '';
+  try {
+    const stat = fs.statSync(SYSTEM_PROMPT_PATH);
+    if (_promptCache.path === SYSTEM_PROMPT_PATH && _promptCache.mtime === stat.mtimeMs) {
+      return _promptCache.content;
+    }
+    const content = fs.readFileSync(SYSTEM_PROMPT_PATH, 'utf8').trim();
+    _promptCache = { content, mtime: stat.mtimeMs, path: SYSTEM_PROMPT_PATH };
+    console.log(`  📝 Custom system prompt loaded (${content.length} chars)`);
+    return content;
+  } catch (err) {
+    console.error(`  ❌ Failed to load custom system prompt: ${err.message}`);
+    return '';
+  }
+}
 
 // ChatMessageSource enum values
 const SOURCE = {
@@ -343,6 +374,16 @@ export function parseGetChatMessageRequest(body, headers) {
   // field 2 = top-level system prompt string
   const systemField = getField(fields, 2, 2);
   let systemPrompt  = systemField ? systemField.value.toString('utf8') : '';
+
+  // Override static Cascade prompt if configured (dynamic IDE additions still appended below)
+  if (SYSTEM_PROMPT_OVERRIDE) {
+    const custom = getCustomSystemPrompt();
+    if (custom) {
+      const originalLen = systemPrompt.length;
+      systemPrompt = custom;
+      console.log(`  🔀 System prompt overridden (${originalLen} → ${custom.length} chars)`);
+    }
+  }
 
   // field 21 = model ID string
   const modelField    = getField(fields, 21, 2);
