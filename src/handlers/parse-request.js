@@ -43,6 +43,73 @@ function getCustomSystemPrompt() {
   }
 }
 
+// ─── Functional section extractor ──────────────────────────
+//
+// Keeps tool/workspace/IDE sections from original Cascade prompt,
+// drops identity ("You are Cascade...") and style sections.
+
+const KEEP_SECTIONS = [
+  'tool_calling',
+  'making_code_changes',
+  'citation_guidelines',
+  'running_commands',
+  'calling_external_apis',
+  'workflows',
+  'user_information',
+  'workspace_information',
+  'memory_system',
+  'ide_metadata',
+];
+
+// Also keep standalone lines that contain functional instructions
+const KEEP_LINE_PATTERNS = [
+  /^There will be an <ephemeral_message>/,
+  /^Bug fixing discipline:/,
+  /^Long-horizon workflow:/,
+  /^Planning cadence:/,
+  /^Testing discipline:/,
+  /^Verification tools:/,
+  /^Progress notes:/,
+];
+
+function extractFunctionalSections(original) {
+  const parts = [];
+
+  // Extract XML sections by tag name
+  for (const tag of KEEP_SECTIONS) {
+    const regex = new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, 'g');
+    let match;
+    while ((match = regex.exec(original)) !== null) {
+      parts.push(match[0]);
+    }
+    // Also match sections that contain nested tags (e.g. workspace_layout inside workspace_information)
+    const openTag = `<${tag} `;
+    const closeTag = `</${tag}>`;
+    let idx = original.indexOf(openTag);
+    while (idx !== -1) {
+      const end = original.indexOf(closeTag, idx);
+      if (end !== -1) {
+        parts.push(original.slice(idx, end + closeTag.length));
+      }
+      idx = original.indexOf(openTag, idx + 1);
+    }
+  }
+
+  // Extract standalone functional lines
+  for (const line of original.split('\n')) {
+    const trimmed = line.trim();
+    if (KEEP_LINE_PATTERNS.some(p => p.test(trimmed))) {
+      parts.push(trimmed);
+    }
+  }
+
+  // Sanitize: strip product identity references from preserved sections
+  let result = parts.join('\n\n');
+  result = result.replace(/\bCascade\b/gi, 'the assistant');
+  result = result.replace(/\bCASCADE\b/g, 'SYSTEM');
+  return result;
+}
+
 // ChatMessageSource enum values
 const SOURCE = {
   UNSPECIFIED:   0,
@@ -380,8 +447,11 @@ export function parseGetChatMessageRequest(body, headers) {
     const custom = getCustomSystemPrompt();
     if (custom) {
       const originalLen = systemPrompt.length;
-      systemPrompt = custom;
-      console.log(`  🔀 System prompt overridden (${originalLen} → ${custom.length} chars)`);
+      // Extract functional XML sections from original prompt (tool instructions,
+      // workspace info, etc.) while dropping identity and style sections.
+      const preserved = extractFunctionalSections(systemPrompt);
+      systemPrompt = preserved ? `${custom}\n\n${preserved}` : custom;
+      console.log(`  🔀 System prompt: custom ${custom.length} + preserved ${preserved.length} chars (was ${originalLen})`);
     }
   }
 
@@ -431,6 +501,23 @@ export function parseGetChatMessageRequest(body, headers) {
   const messages = mergeConsecutiveMessages(
     parsedPrompts.map(toAnthropicMessage).filter(Boolean)
   );
+
+  // Sanitize product identity from conversation messages (ephemeral messages say "CASCADE system")
+  if (SYSTEM_PROMPT_OVERRIDE) {
+    for (const m of messages) {
+      if (typeof m.content === 'string') {
+        m.content = m.content.replace(/\bCASCADE\b/g, 'SYSTEM');
+        m.content = m.content.replace(/\bCascade\b/g, 'the assistant');
+      } else if (Array.isArray(m.content)) {
+        for (const block of m.content) {
+          if (block.type === 'text' && block.text) {
+            block.text = block.text.replace(/\bCASCADE\b/g, 'SYSTEM');
+            block.text = block.text.replace(/\bCascade\b/g, 'the assistant');
+          }
+        }
+      }
+    }
+  }
 
   // field 10 = repeated ChatToolDefinition
   const toolFields = getAllFields(fields, 10);

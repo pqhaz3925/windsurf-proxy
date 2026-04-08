@@ -42,12 +42,20 @@ const MODEL_MAP = {
   'MODEL_GOOGLE_GEMINI_2_5_FLASH': DEFAULT_MODEL,
   'MODEL_GOOGLE_GEMINI_2_5_PRO':   DEFAULT_MODEL,
   // GPT models → OpenAI
-  'gpt-5-4-low':             'gpt-5.4',
-  'gpt-5-4-high':            'gpt-5.4',
-  'gpt-5-4-xhigh':           'gpt-5.4',
-  'MODEL_GPT_4O':            'gpt-4o',
-  'MODEL_GPT_4O_MINI':       'gpt-4o-mini',
+  'gpt-5-4-low':              'gpt-5.4',
+  'gpt-5-4-high':             'gpt-5.4',
+  'gpt-5-4-xhigh':            'gpt-5.4',
+  'gpt-5-4-xhigh-priority':   'gpt-5.4',   // fast mode
+  'MODEL_GPT_4O':             'gpt-4o',
+  'MODEL_GPT_4O_MINI':        'gpt-4o-mini',
 };
+
+// Detect fast mode from Windsurf model ID (suffix "-priority" = service_tier: fast)
+function getServiceTier(requestedModel) {
+  if (!requestedModel) return undefined;
+  if (requestedModel.endsWith('-priority')) return 'fast';
+  return undefined;
+}
 
 function isOpenAIModel(requestedModel) {
   if (!requestedModel) return false;
@@ -70,13 +78,14 @@ export function handleGetChatMessage(req, res, body) {
 
   const useOpenAI = isOpenAIModel(requestedModel);
   const resolvedModel = MODEL_MAP[requestedModel] || DEFAULT_MODEL;
+  const serviceTier = getServiceTier(requestedModel);
   const messageId = crypto.randomUUID();
 
   // Inject model identity so the model knows what it is
   const provider = useOpenAI ? 'OpenAI' : 'Anthropic';
   systemPrompt += `\n\nYou are powered by ${resolvedModel} (${provider}).`;
 
-  console.log(`  🧠 Model: ${requestedModel} → ${resolvedModel} (${provider})`);
+  console.log(`  🧠 Model: ${requestedModel} → ${resolvedModel} (${provider})${serviceTier ? ` [tier: ${serviceTier}]` : ''}`);
   console.log(`  📝 System prompt: ${systemPrompt.length} chars`);
   console.log(`  💬 Messages: ${messages.length}`);
   if (tools) console.log(`  🔧 Tools: ${tools.length}`);
@@ -104,7 +113,7 @@ export function handleGetChatMessage(req, res, body) {
   console.log(`  💰 Initiator: ${initiator} (last msg: role=${lastMsg?.role}, blocks=${Array.isArray(lastMsg?.content) ? lastMsg.content.map(b=>b.type).join(',') : 'string'})`);
 
   if (useOpenAI) {
-    streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId });
+    streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, serviceTier, messageId });
   } else {
     streamAnthropic(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId });
   }
@@ -222,7 +231,7 @@ function streamAnthropic(req, res, { systemPrompt, messages, tools, toolChoice, 
 
 // ─── OpenAI Responses API streaming ─────────────────────────
 
-function streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId }) {
+function streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, serviceTier, messageId }) {
   // Convert Anthropic-format messages to OpenAI format
   const openaiMessages = toOpenAIMessages(systemPrompt, messages);
 
@@ -233,6 +242,7 @@ function streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, res
     stream: true,
     reasoning: { effort: 'high', summary: 'auto' },
   };
+  if (serviceTier) apiPayload.service_tier = serviceTier;
   if (tools && tools.length > 0) {
     apiPayload.tools = tools.map(t => ({
       type: 'function',
