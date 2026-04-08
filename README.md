@@ -57,12 +57,22 @@ ANTHROPIC_API_HOST=api.anthropic.com
 ANTHROPIC_API_KEY=sk-ant-xxxxx
 ```
 
+For GPT model support, add OpenAI credentials:
+
+```env
+OPENAI_API_HOST=api.openai.com
+OPENAI_API_KEY=sk-xxxxx
+```
+
+> **Unified endpoint?** If your API serves both Anthropic and OpenAI formats (e.g. `codex.example.com`), set both `*_API_HOST` vars to the same host and use the same key for both `*_API_KEY` vars.
+
 Optional:
 
 ```env
-# ANTHROPIC_API_PATH=/v1/messages    # custom endpoint path
-# DEFAULT_MODEL=claude-sonnet-4-6    # fallback model
-# MAX_TOKENS=16384                   # max output tokens
+# ANTHROPIC_API_PATH=/v1/messages       # custom Anthropic endpoint path
+# OPENAI_API_PATH=/v1/chat/completions  # custom OpenAI endpoint path
+# DEFAULT_MODEL=claude-sonnet-4-6       # fallback model for unknown IDs
+# MAX_TOKENS=16384                      # max output tokens
 ```
 
 ### 3. Generate MITM certificates
@@ -188,18 +198,20 @@ Open Cascade chat, send a message. The proxy terminal should show:
 
 ## Model mapping
 
-Windsurf sends internal model IDs. The proxy maps them to Anthropic models in `src/handlers/chat.js`:
+Windsurf sends internal model IDs. The proxy detects the provider and routes to the correct API:
 
-| Windsurf sends | Proxy uses |
-|---|---|
-| `claude-sonnet-4-6-thinking` | `claude-sonnet-4-6` |
-| `claude-opus-4-6-thinking` | `claude-opus-4-6` |
-| `MODEL_SWE_1_5` / `MODEL_SWE_1_5_SLOW` | `claude-sonnet-4-6` |
-| `gpt-5-4-low` / `gpt-5-4-high` | `claude-sonnet-4-6` |
-| `MODEL_GOOGLE_GEMINI_*` | `claude-sonnet-4-6` |
-| Everything else | `DEFAULT_MODEL` env var |
+| Windsurf sends | Provider | Actual model |
+|---|---|---|
+| `claude-sonnet-4-6-thinking` | Anthropic | `claude-sonnet-4-6` |
+| `claude-opus-4-6-thinking` | Anthropic | `claude-opus-4-6` |
+| `MODEL_SWE_1_5` / `MODEL_SWE_1_5_SLOW` | Anthropic | `claude-sonnet-4-6` |
+| `gpt-5-4-low` / `gpt-5-4-high` | **OpenAI** | `gpt-5.4` |
+| `MODEL_GPT_4O` | **OpenAI** | `gpt-4o` |
+| `MODEL_GPT_4O_MINI` | **OpenAI** | `gpt-4o-mini` |
+| `MODEL_GOOGLE_GEMINI_*` | Anthropic | `claude-sonnet-4-6` |
+| Everything else | Anthropic | `DEFAULT_MODEL` env var |
 
-Edit the `MODEL_MAP` object to change any mapping.
+Edit `MODEL_MAP` and `OPENAI_MODELS` in `src/handlers/chat.js` to customize routing.
 
 ---
 

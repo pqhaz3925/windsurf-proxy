@@ -8,6 +8,7 @@ import crypto from 'node:crypto';
 import { parseGetChatMessageRequest } from './parse-request.js';
 import { buildErrorChunk } from './build-response.js';
 import { AnthropicStreamProcessor, parseSSEChunk } from './anthropic-stream.js';
+import { OpenAIStreamProcessor, parseOpenAISSEChunk } from './openai-stream.js';
 import { wrapEnvelope, endOfStreamEnvelope, streamHeaders } from '../connect.js';
 
 // ─── Config ────────────────────────────────────────────────
@@ -18,55 +19,73 @@ const API_KEY  = process.env.ANTHROPIC_API_KEY  || '';
 const DEFAULT_MODEL = process.env.DEFAULT_MODEL  || 'claude-sonnet-4-6';
 const MAX_TOKENS = parseInt(process.env.MAX_TOKENS || '16384', 10);
 
-// Map Windsurf model IDs → Anthropic model names
+// OpenAI config (uses same host by default for unified endpoints like codex.alsa-llc.site)
+const OPENAI_API_HOST = process.env.OPENAI_API_HOST || API_HOST;
+const OPENAI_API_PATH = process.env.OPENAI_API_PATH || '/v1/chat/completions';
+const OPENAI_API_KEY  = process.env.OPENAI_API_KEY  || API_KEY;
+
+// ─── Provider detection ────────────────────────────────────
+
+// Models that should route through OpenAI Chat Completions API
+const OPENAI_MODELS = new Set([
+  'gpt-5-4-low', 'gpt-5-4-high',
+  'MODEL_GPT_4O', 'MODEL_GPT_4O_MINI',
+]);
+
+// Map Windsurf model IDs → actual model names
+// GPT models go through OpenAI endpoint, Claude models through Anthropic
 const MODEL_MAP = {
+  // Claude models → Anthropic
   'MODEL_SWE_1_5':           DEFAULT_MODEL,
   'MODEL_SWE_1_5_SLOW':      DEFAULT_MODEL,
   'claude-opus-4-6-thinking': 'claude-opus-4-6',
   'claude-sonnet-4-6-thinking': DEFAULT_MODEL,
-  'gpt-5-4-low':             DEFAULT_MODEL,
-  'gpt-5-4-high':            DEFAULT_MODEL,
   'MODEL_CHAT_11121':        DEFAULT_MODEL,
-  // Windsurf internal models (sub-tasks, summarization)
   'MODEL_GOOGLE_GEMINI_2_5_FLASH': DEFAULT_MODEL,
   'MODEL_GOOGLE_GEMINI_2_5_PRO':   DEFAULT_MODEL,
-  'MODEL_GPT_4O':            DEFAULT_MODEL,
-  'MODEL_GPT_4O_MINI':       DEFAULT_MODEL,
+  // GPT models → OpenAI
+  'gpt-5-4-low':             'gpt-5.4',
+  'gpt-5-4-high':            'gpt-5.4',
+  'MODEL_GPT_4O':            'gpt-4o',
+  'MODEL_GPT_4O_MINI':       'gpt-4o-mini',
 };
+
+function isOpenAIModel(requestedModel) {
+  return OPENAI_MODELS.has(requestedModel);
+}
 
 // ─── Main handler ──────────────────────────────────────────
 
 export function handleGetChatMessage(req, res, body) {
-  if (!API_KEY) {
-    console.error('  ❌ ANTHROPIC_API_KEY not set — cannot forward to API');
+  const apiKey = isOpenAIModel(/* peek model before full parse */null) ? OPENAI_API_KEY : API_KEY;
+  if (!API_KEY && !OPENAI_API_KEY) {
+    console.error('  ❌ No API key set — cannot forward to API');
     res.writeHead(500);
-    res.end('ANTHROPIC_API_KEY not configured');
+    res.end('No API key configured');
     return;
   }
 
   const { systemPrompt, messages, tools, toolChoice, requestedModel, initiator } =
     parseGetChatMessageRequest(body, req.headers);
 
-  const anthropicModel = MODEL_MAP[requestedModel] || DEFAULT_MODEL;
+  const useOpenAI = isOpenAIModel(requestedModel);
+  const resolvedModel = MODEL_MAP[requestedModel] || DEFAULT_MODEL;
   const messageId = crypto.randomUUID();
 
-  console.log(`  🧠 Model: ${requestedModel} → ${anthropicModel}`);
+  console.log(`  🧠 Model: ${requestedModel} → ${resolvedModel} (${useOpenAI ? 'OpenAI' : 'Anthropic'})`);
   console.log(`  📝 System prompt: ${systemPrompt.length} chars`);
   console.log(`  💬 Messages: ${messages.length}`);
   if (tools) console.log(`  🔧 Tools: ${tools.length}`);
   if (toolChoice) console.log(`  🔧 ToolChoice: ${JSON.stringify(toolChoice)}`);
 
-  // Log first/last message roles for debugging
   if (messages.length > 0) {
     const roles = messages.map(m => m.role).join(',');
     console.log(`  💬 Roles: ${roles}`);
-    // Warn if consecutive same-role (should never happen after merge)
     for (let i = 1; i < messages.length; i++) {
       if (messages[i].role === messages[i-1].role) {
         console.warn(`  ⚠️  Consecutive ${messages[i].role} at index ${i-1},${i} — merge failed?`);
       }
     }
-    // Check for tool_result messages
     for (const m of messages) {
       if (Array.isArray(m.content)) {
         for (const b of m.content) {
@@ -77,35 +96,35 @@ export function handleGetChatMessage(req, res, body) {
     }
   }
 
-  // Build Anthropic API request
+  const lastMsg = messages[messages.length - 1];
+  console.log(`  💰 Initiator: ${initiator} (last msg: role=${lastMsg?.role}, blocks=${Array.isArray(lastMsg?.content) ? lastMsg.content.map(b=>b.type).join(',') : 'string'})`);
+
+  if (useOpenAI) {
+    streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId });
+  } else {
+    streamAnthropic(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId });
+  }
+}
+
+// ─── Anthropic streaming ────────────────────────────────────
+
+function streamAnthropic(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId }) {
   const apiPayload = {
-    model: anthropicModel,
+    model: resolvedModel,
     system: systemPrompt || undefined,
     messages,
     stream: true,
     max_tokens: MAX_TOKENS,
   };
-
-  // Pass through tool definitions if present
   if (tools && tools.length > 0) {
     apiPayload.tools = tools;
     if (toolChoice) apiPayload.tool_choice = toolChoice;
   }
 
-  // Initiator is pre-computed from the ORIGINAL (pre-merge) last message
-  // so tool_result-only rounds stay classified as 'agent' (free)
-  const lastMsg = messages[messages.length - 1];
-  console.log(`  💰 Initiator: ${initiator} (last msg: role=${lastMsg?.role}, blocks=${Array.isArray(lastMsg?.content) ? lastMsg.content.map(b=>b.type).join(',') : 'string'})`);
-
   const apiBody = JSON.stringify(apiPayload);
-
-  // Write streaming response headers
   res.writeHead(200, streamHeaders());
+  const processor = new AnthropicStreamProcessor(messageId, resolvedModel);
 
-  // Create stream processor
-  const processor = new AnthropicStreamProcessor(messageId, anthropicModel);
-
-  // Call Anthropic API
   const apiReq = https.request({
     hostname: API_HOST,
     port: 443,
@@ -122,7 +141,7 @@ export function handleGetChatMessage(req, res, body) {
     let sseBuffer = '';
 
     if (apiRes.statusCode !== 200) {
-      console.error(`  ❌ API returned ${apiRes.statusCode}`);
+      console.error(`  ❌ Anthropic API returned ${apiRes.statusCode}`);
       let errBody = '';
       apiRes.setEncoding('utf8');
       apiRes.on('data', d => errBody += d);
@@ -169,7 +188,7 @@ export function handleGetChatMessage(req, res, body) {
     });
 
     apiRes.on('error', (err) => {
-      console.error(`  ❌ API stream error: ${err.message}`);
+      console.error(`  ❌ Anthropic stream error: ${err.message}`);
       if (!res.writableEnded) {
         res.write(wrapEnvelope(buildErrorChunk(messageId, `[Stream Error]`)));
         res.write(endOfStreamEnvelope());
@@ -179,7 +198,7 @@ export function handleGetChatMessage(req, res, body) {
   });
 
   apiReq.on('error', (err) => {
-    console.error(`  ❌ API request error: ${err.message}`);
+    console.error(`  ❌ Anthropic request error: ${err.message}`);
     if (!res.writableEnded) {
       res.write(wrapEnvelope(buildErrorChunk(messageId, `[Connection Error]`)));
       res.write(endOfStreamEnvelope());
@@ -187,16 +206,231 @@ export function handleGetChatMessage(req, res, body) {
     }
   });
 
-  // Abort upstream API call if client disconnects mid-stream (saves tokens)
-  // Use res.on('close') — fires when the RESPONSE socket drops, meaning the
-  // client actually disconnected. req.on('close') fires too early (after request
-  // body is consumed) and would kill the API request before it even responds.
   res.on('close', () => {
     if (!res.writableEnded && !apiReq.destroyed) {
-      console.log(`  🔌 Client disconnected mid-stream, aborting API call`);
+      console.log(`  🔌 Client disconnected mid-stream, aborting Anthropic call`);
       apiReq.destroy();
     }
   });
 
   apiReq.end(apiBody);
+}
+
+// ─── OpenAI streaming ───────────────────────────────────────
+
+function streamOpenAI(req, res, { systemPrompt, messages, tools, toolChoice, resolvedModel, messageId }) {
+  // Convert Anthropic-format messages to OpenAI format
+  const openaiMessages = toOpenAIMessages(systemPrompt, messages);
+
+  const apiPayload = {
+    model: resolvedModel,
+    messages: openaiMessages,
+    stream: true,
+  };
+  if (tools && tools.length > 0) {
+    apiPayload.tools = tools.map(t => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description || '',
+        parameters: typeof t.input_schema === 'string' ? JSON.parse(t.input_schema) : t.input_schema,
+      },
+    }));
+    if (toolChoice) {
+      if (toolChoice.type === 'auto') apiPayload.tool_choice = 'auto';
+      else if (toolChoice.type === 'any') apiPayload.tool_choice = 'required';
+      else if (toolChoice.type === 'tool') apiPayload.tool_choice = { type: 'function', function: { name: toolChoice.name } };
+    }
+  }
+
+  const apiBody = JSON.stringify(apiPayload);
+  res.writeHead(200, streamHeaders());
+  const processor = new OpenAIStreamProcessor(messageId, resolvedModel);
+
+  const apiReq = https.request({
+    hostname: OPENAI_API_HOST,
+    port: 443,
+    path: OPENAI_API_PATH,
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'accept': 'text/event-stream',
+      'authorization': `Bearer ${OPENAI_API_KEY}`,
+      'content-length': Buffer.byteLength(apiBody),
+    },
+  }, (apiRes) => {
+    let sseBuffer = '';
+
+    if (apiRes.statusCode !== 200) {
+      console.error(`  ❌ OpenAI API returned ${apiRes.statusCode}`);
+      let errBody = '';
+      apiRes.setEncoding('utf8');
+      apiRes.on('data', d => errBody += d);
+      apiRes.on('end', () => {
+        console.error(`  ❌ Body: ${errBody.slice(0, 500)}`);
+        res.write(wrapEnvelope(buildErrorChunk(messageId, `[OpenAI Error ${apiRes.statusCode}]`)));
+        res.write(endOfStreamEnvelope());
+        res.end();
+      });
+      return;
+    }
+
+    apiRes.setEncoding('utf8');
+
+    function processPart(part) {
+      const events = parseOpenAISSEChunk(part + '\n');
+      for (const evt of events) {
+        const protoChunks = processor.processEvent(evt);
+        for (const chunk of protoChunks) {
+          res.write(wrapEnvelope(chunk));
+        }
+      }
+      if (processor.isDone && !res.writableEnded) {
+        res.write(endOfStreamEnvelope());
+        res.end();
+        console.log(`  ✅ OpenAI stream done (stop: ${processor.stopReason})`);
+      }
+    }
+
+    apiRes.on('data', (chunk) => {
+      sseBuffer += chunk;
+      const parts = sseBuffer.split('\n\n');
+      sseBuffer = parts.pop();
+      for (const part of parts) processPart(part);
+    });
+
+    apiRes.on('end', () => {
+      if (sseBuffer.trim()) processPart(sseBuffer);
+      if (!res.writableEnded) {
+        res.write(endOfStreamEnvelope());
+        res.end();
+        console.log(`  ✅ OpenAI stream ended`);
+      }
+    });
+
+    apiRes.on('error', (err) => {
+      console.error(`  ❌ OpenAI stream error: ${err.message}`);
+      if (!res.writableEnded) {
+        res.write(wrapEnvelope(buildErrorChunk(messageId, `[Stream Error]`)));
+        res.write(endOfStreamEnvelope());
+        res.end();
+      }
+    });
+  });
+
+  apiReq.on('error', (err) => {
+    console.error(`  ❌ OpenAI request error: ${err.message}`);
+    if (!res.writableEnded) {
+      res.write(wrapEnvelope(buildErrorChunk(messageId, `[Connection Error]`)));
+      res.write(endOfStreamEnvelope());
+      res.end();
+    }
+  });
+
+  res.on('close', () => {
+    if (!res.writableEnded && !apiReq.destroyed) {
+      console.log(`  🔌 Client disconnected mid-stream, aborting OpenAI call`);
+      apiReq.destroy();
+    }
+  });
+
+  apiReq.end(apiBody);
+}
+
+// ─── Anthropic → OpenAI message format converter ────────────
+
+function toOpenAIMessages(systemPrompt, anthropicMessages) {
+  const result = [];
+
+  // System prompt → system message
+  if (systemPrompt) {
+    result.push({ role: 'system', content: systemPrompt });
+  }
+
+  for (const msg of anthropicMessages) {
+    if (typeof msg.content === 'string') {
+      result.push({ role: msg.role, content: msg.content });
+      continue;
+    }
+
+    // Content is array of blocks — convert to OpenAI format
+    if (!Array.isArray(msg.content)) {
+      result.push({ role: msg.role, content: String(msg.content) });
+      continue;
+    }
+
+    if (msg.role === 'assistant') {
+      // Assistant messages may have text + tool_use blocks
+      let textContent = '';
+      const toolCalls = [];
+
+      for (const block of msg.content) {
+        if (block.type === 'text') {
+          textContent += block.text;
+        } else if (block.type === 'tool_use') {
+          toolCalls.push({
+            id: block.id,
+            type: 'function',
+            function: {
+              name: block.name,
+              arguments: typeof block.input === 'string' ? block.input : JSON.stringify(block.input),
+            },
+          });
+        }
+        // thinking blocks are dropped — OpenAI doesn't support them
+      }
+
+      const assistantMsg = { role: 'assistant' };
+      if (textContent) assistantMsg.content = textContent;
+      else assistantMsg.content = null;
+      if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
+      result.push(assistantMsg);
+
+    } else if (msg.role === 'user') {
+      // User messages may have text, image, or tool_result blocks
+      const toolResults = [];
+      const contentParts = [];
+
+      for (const block of msg.content) {
+        if (block.type === 'text') {
+          contentParts.push(block.text);
+        } else if (block.type === 'image') {
+          contentParts.push({
+            type: 'image_url',
+            image_url: {
+              url: `data:${block.source?.media_type || 'image/png'};base64,${block.source?.data || ''}`,
+            },
+          });
+        } else if (block.type === 'tool_result') {
+          toolResults.push({
+            role: 'tool',
+            tool_call_id: block.tool_use_id,
+            content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+          });
+        }
+      }
+
+      // Tool results become separate messages in OpenAI format
+      for (const tr of toolResults) {
+        result.push(tr);
+      }
+
+      // Regular content
+      if (contentParts.length > 0) {
+        const hasImages = contentParts.some(p => typeof p !== 'string');
+        if (hasImages) {
+          result.push({
+            role: 'user',
+            content: contentParts.map(p =>
+              typeof p === 'string' ? { type: 'text', text: p } : p
+            ),
+          });
+        } else {
+          result.push({ role: 'user', content: contentParts.join('\n') });
+        }
+      }
+    }
+  }
+
+  return result;
 }
